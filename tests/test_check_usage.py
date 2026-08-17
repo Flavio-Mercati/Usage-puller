@@ -112,6 +112,44 @@ CLAUDE_LIVE = {
     ],
 }
 
+# Shape D: a scoped per-model pool as the endpoint really expresses it. `scope` is a
+# nested object, not a string, and the pool is a distinct weekly bucket alongside
+# weekly_all -- captured from a live Max account.
+CLAUDE_SCOPED = {
+    "five_hour": {"utilization": 2.0, "resets_at": "2026-08-17T19:09:59.988021+00:00"},
+    "seven_day": {"utilization": 47.0, "resets_at": "2026-08-21T09:59:59.988048+00:00"},
+    "seven_day_opus": None,
+    "limits": [
+        {
+            "kind": "session",
+            "group": "session",
+            "percent": 2,
+            "severity": "normal",
+            "resets_at": "2026-08-17T19:09:59.988021+00:00",
+            "scope": None,
+            "is_active": False,
+        },
+        {
+            "kind": "weekly_all",
+            "group": "weekly",
+            "percent": 47,
+            "severity": "normal",
+            "resets_at": "2026-08-21T09:59:59.988048+00:00",
+            "scope": None,
+            "is_active": False,
+        },
+        {
+            "kind": "weekly_scoped",
+            "group": "weekly",
+            "percent": 81,
+            "severity": "warning",
+            "resets_at": "2026-08-21T09:59:59.988284+00:00",
+            "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+            "is_active": True,
+        },
+    ],
+}
+
 CODEX_SUBSCRIPTION = {"hard_limit_usd": 100.0, "plan": {"title": "Pay-as-you-go"}}
 CODEX_USAGE = {"total_usage": 4250.0}  # API reports cents
 MODELS_HEADERS = {
@@ -199,9 +237,12 @@ def test_claude_flat_payload() -> None:
     assert report.status == cu.STATUS_OK, report.message
     assert _windows(report) == {"5h": 24.0, "7d": 62.0, "Fable 5h": 12.0, "Fable 7d": 38.0}
     assert dict(report.facts)["Extra credits"] == "$3.40 / $50.00"
-    # Only the 5-hour session window keeps a countdown.
+    # Each distinct reset moment shows once: 7d and Fable 7d share one, so only the
+    # first of them carries the countdown.
     assert report.windows[0].resets_at is not None
-    assert all(w.resets_at is None for w in report.windows[1:])
+    with_reset = [w.label for w in report.windows if w.resets_at is not None]
+    assert "7d" in with_reset
+    assert "Fable 7d" not in with_reset
 
 
 def test_claude_nested_payload_matches_flat() -> None:
@@ -253,6 +294,45 @@ def test_claude_unrecognised_payload_is_partial() -> None:
     assert "no recognisable" in (report.message or "")
 
 
+def test_claude_scoped_pool_from_nested_scope_object() -> None:
+    """`scope: {"model": {"display_name": "Fable"}}` must label the pool, not stringify."""
+    report = _resolve_claude(CLAUDE_SCOPED)
+    assert report.status == cu.STATUS_OK, report.message
+    assert _windows(report) == {"5h": 2.0, "7d": 47.0, "Fable 7d": 81.0}
+    rendered = cu.SummaryFormatter().render([report])
+    assert "Fable 7d: 81%" in rendered
+    assert "{" not in rendered and "display_name" not in rendered
+
+
+def test_claude_scoped_pool_surfaces_severity() -> None:
+    """A provider `warning` must reach the summary; it is the cue to change behaviour."""
+    report = _resolve_claude(CLAUDE_SCOPED)
+    fable = next(w for w in report.windows if w.label == "Fable 7d")
+    assert fable.severity == "warning"
+    assert "Fable 7d: 81% (warning)" in cu.SummaryFormatter().render([report])
+    # A normal severity must not add noise.
+    assert "(normal)" not in cu.SummaryFormatter().render([report])
+
+
+def test_claude_weekly_reset_shown_once_across_pools() -> None:
+    """Both the session and weekly countdowns show; the shared weekly one is not repeated."""
+    report = _resolve_claude(CLAUDE_SCOPED)
+    with_resets = [w.label for w in report.windows if w.resets_at is not None]
+    assert with_resets == ["5h", "7d"], with_resets
+    rendered = cu.SummaryFormatter().render([report])
+    assert rendered.count("resets ") == 2
+
+
+def test_claude_scoped_pool_exposes_remaining_in_json() -> None:
+    """Remaining headroom is the number that matters when deliberately burning a pool."""
+    payload = cu.build_json_payload([_resolve_claude(CLAUDE_SCOPED)])
+    fable = next(
+        w for w in payload["providers"][0]["windows"] if w["label"] == "Fable 7d"
+    )
+    assert fable["remaining_percent"] == 19.0
+    assert fable["severity"] == "warning"
+
+
 def test_claude_live_payload_shape() -> None:
     """The layout api.anthropic.com actually returns, parsed via limits[]."""
     report = _resolve_claude(CLAUDE_LIVE)
@@ -260,7 +340,9 @@ def test_claude_live_payload_shape() -> None:
     assert _windows(report) == {"5h": 5.0, "7d": 45.0}
     assert report.windows[0].label == "5h"
     assert report.windows[0].resets_at is not None
-    assert report.windows[1].resets_at is None
+    # The weekly countdown is actionable, so it is shown rather than suppressed.
+    assert report.windows[1].label == "7d"
+    assert report.windows[1].resets_at is not None
 
 
 def test_claude_live_payload_reports_empty_sub_pools_explicitly() -> None:

@@ -148,6 +148,8 @@ class Window:
     used: Optional[float] = None
     limit: Optional[float] = None
     unit: Optional[str] = None
+    # Provider-supplied urgency ("normal", "warning", ...). Surfaced when not normal.
+    severity: Optional[str] = None
 
     @property
     def is_empty(self) -> bool:
@@ -164,6 +166,8 @@ class Window:
             parts.append(f"{self.used:g}{self.unit or ''}")
         else:
             parts.append("n/a")
+        if self.severity and self.severity.lower() not in ("normal", "ok", "none"):
+            parts.append(f"({self.severity.lower()})")
         if with_reset and self.resets_at is not None:
             remaining = format_timedelta(self.resets_at - utcnow())
             if remaining:
@@ -183,6 +187,10 @@ class Window:
             "used": self.used,
             "limit": self.limit,
             "unit": self.unit,
+            "severity": self.severity,
+            "remaining_percent": (
+                round(100.0 - self.percent, 2) if self.percent is not None else None
+            ),
         }
 
 
@@ -1128,11 +1136,19 @@ class ClaudeResolver(QuotaResolver):
                 if not any(existing.label == w.label for existing in windows)
             )
 
+        # Show each distinct reset moment once. The session timer and the weekly timer
+        # are both actionable (pacing a scoped pool against the weekly reset is the whole
+        # point), but every 7d pool shares one weekly reset, so repeating an identical
+        # countdown per pool bloats the line without adding information.
+        seen_resets: set = set()
         for window in windows:
-            # Only the 5-hour session window shows a countdown; four timers in one
-            # line stops being copiable.
-            if window.label != "5h":
-                window.resets_at = None
+            if window.resets_at is not None:
+                # 5-minute buckets: timestamps within one payload differ by microseconds.
+                bucket = int(window.resets_at.timestamp() // 300)
+                if bucket in seen_resets:
+                    window.resets_at = None
+                else:
+                    seen_resets.add(bucket)
             report.windows.append(window)
 
         extra = self._extra_credits(payload)
@@ -1188,21 +1204,45 @@ class ClaudeResolver(QuotaResolver):
                     continue
             if any(w.label == label for w in windows):
                 continue
+            severity = entry.get("severity")
             windows.append(
                 Window(
                     label=label,
                     percent=percent,
                     resets_at=parse_timestamp(entry.get("resets_at")),
+                    severity=str(severity) if severity else None,
                 )
             )
         windows.sort(key=lambda w: (w.label not in ("5h", "7d"), w.label != "5h"))
         return windows
 
     @staticmethod
-    def _sub_pool_label(kind: str, group: Any, scope: Any) -> str:
-        """Turn ``weekly_opus`` / ``scope=claude-fable-5`` into ``Opus 7d`` / ``Fable 7d``."""
+    def _scope_name(scope: Any) -> Optional[str]:
+        """Pull a display name out of a ``scope`` field.
+
+        Real payloads nest it as ``{"model": {"id": ..., "display_name": "Fable"},
+        "surface": null}``; older shapes use a plain string. Anything else yields None
+        so the caller falls back to the ``kind``.
+        """
+        if isinstance(scope, str):
+            return scope or None
+        if not isinstance(scope, dict):
+            return None
+        for field_name in ("model", "surface"):
+            value = scope.get(field_name)
+            if isinstance(value, dict):
+                name = value.get("display_name") or value.get("id") or value.get("name")
+                if name:
+                    return str(name)
+            elif isinstance(value, str) and value:
+                return value
+        return None
+
+    @classmethod
+    def _sub_pool_label(cls, kind: str, group: Any, scope: Any) -> str:
+        """Turn ``weekly_opus`` / ``scope.model.display_name`` into ``Opus 7d`` / ``Fable 7d``."""
         window = {"session": "5h", "weekly": "7d"}.get(str(group or "").lower(), "")
-        name = str(scope or kind or "pool")
+        name = cls._scope_name(scope) or kind or "pool"
         for prefix in ("weekly_", "session_", "seven_day_", "five_hour_"):
             if name.startswith(prefix):
                 name = name[len(prefix):]
@@ -1210,7 +1250,7 @@ class ClaudeResolver(QuotaResolver):
         name = name.replace("claude-", "").replace("-", " ").replace("_", " ").strip()
         # Drop a trailing version digit: "fable 5" -> "Fable".
         parts = [p for p in name.split() if not p.isdigit()]
-        pretty = " ".join(p.capitalize() for p in parts) or "Pool"
+        pretty = " ".join(p if p[:1].isupper() else p.capitalize() for p in parts) or "Pool"
         return f"{pretty} {window}".strip()
 
     def _windows_from_flat_keys(self, payload: Any) -> List[Window]:
