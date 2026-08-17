@@ -633,8 +633,14 @@ claude
 - Prefer `CLAUDE_REFRESH_TOKEN` over `CLAUDE_ACCESS_TOKEN` in CI: the access token
   expires within hours, and storing it means re-rotating the secret constantly.
 - GitHub Secrets are masked in logs, but the **step summary is not a log** — it contains
-  quota percentages, never credentials. Keep the repository private anyway if your
-  spend figures are sensitive.
+  quota percentages, never credentials.
+- **On a public repository, run logs, step summaries and artifacts are world-readable.**
+  Secrets stay encrypted and `workflow_dispatch` requires write access, so credentials
+  are safe — but your consumption figures are published. A step summary cannot be
+  deleted on its own, so the workflow's final step deletes this workflow's *older* runs,
+  bounding what is exposed to the single most recent snapshot. The current run must
+  survive for you to read it, so the floor is one snapshot, not zero. Artifact retention
+  is 1 day. Keep the repository private if even one snapshot is too much.
 - The GCP service account needs only two read-only roles. Do not reuse a key that has
   write access to your project.
 

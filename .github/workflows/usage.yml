@@ -24,6 +24,9 @@ on:
 
 permissions:
   contents: read
+  # Needed by the prune step to delete this workflow's older runs, which is the
+  # only way to remove a step summary once written.
+  actions: write
 
 concurrency:
   group: ai-usage-snapshot
@@ -99,5 +102,28 @@ jobs:
         with:
           name: usage-snapshot
           path: usage-snapshot.json
-          retention-days: 7
+          retention-days: 1
           if-no-files-found: warn
+
+      # On a public repository, run logs, step summaries and artifacts are all
+      # world-readable, and a summary cannot be deleted on its own. Deleting the older
+      # runs bounds what is exposed to the single most recent snapshot: the current run
+      # has to survive for you to read it.
+      - name: Prune previous runs of this workflow
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          deleted=0
+          for id in $(gh api --paginate \
+                "repos/${REPO}/actions/workflows/usage.yml/runs?per_page=100" \
+                --jq '.workflow_runs[].id' 2>/dev/null); do
+            [ "$id" = "$CURRENT_RUN" ] && continue
+            if gh api -X DELETE "repos/${REPO}/actions/runs/${id}" >/dev/null 2>&1; then
+              deleted=$((deleted + 1))
+            fi
+          done
+          echo "Pruned ${deleted} previous run(s); only run ${CURRENT_RUN} remains public."
