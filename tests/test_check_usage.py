@@ -62,6 +62,56 @@ CLAUDE_NESTED = {
     ],
 }
 
+# Shape C: the layout api.anthropic.com actually returns (captured from a live account,
+# values altered). Note there is no `fable` key: the per-model slots are named/codenamed
+# and mostly null, and `limits[]` is the authoritative structure.
+CLAUDE_LIVE = {
+    "five_hour": {
+        "utilization": 5.0,
+        "resets_at": "2026-08-17T14:00:00.331786+00:00",
+        "limit_dollars": None,
+        "used_dollars": None,
+    },
+    "seven_day": {
+        "utilization": 45.0,
+        "resets_at": "2026-08-21T10:00:00.331807+00:00",
+    },
+    "seven_day_oauth_apps": None,
+    "seven_day_opus": None,
+    "seven_day_sonnet": None,
+    "seven_day_cowork": None,
+    "tangelo": None,
+    "nimbus_quill": {"utilization": 0.0, "resets_at": None},
+    "extra_usage": {
+        "is_enabled": False,
+        "monthly_limit": None,
+        "used_credits": None,
+        "utilization": None,
+        "currency": None,
+        "user_disabled": True,
+    },
+    "limits": [
+        {
+            "kind": "session",
+            "group": "session",
+            "percent": 5,
+            "severity": "normal",
+            "resets_at": "2026-08-17T14:00:00.331786+00:00",
+            "scope": None,
+            "is_active": False,
+        },
+        {
+            "kind": "weekly_all",
+            "group": "weekly",
+            "percent": 45,
+            "severity": "normal",
+            "resets_at": "2026-08-21T10:00:00.331807+00:00",
+            "scope": None,
+            "is_active": False,
+        },
+    ],
+}
+
 CODEX_SUBSCRIPTION = {"hard_limit_usd": 100.0, "plan": {"title": "Pay-as-you-go"}}
 CODEX_USAGE = {"total_usage": 4250.0}  # API reports cents
 MODELS_HEADERS = {
@@ -201,6 +251,89 @@ def test_claude_unrecognised_payload_is_partial() -> None:
     report = _resolve_claude({"something_else": {"foo": 1}})
     assert report.status == cu.STATUS_PARTIAL
     assert "no recognisable" in (report.message or "")
+
+
+def test_claude_live_payload_shape() -> None:
+    """The layout api.anthropic.com actually returns, parsed via limits[]."""
+    report = _resolve_claude(CLAUDE_LIVE)
+    assert report.status == cu.STATUS_OK, report.message
+    assert _windows(report) == {"5h": 5.0, "7d": 45.0}
+    assert report.windows[0].label == "5h"
+    assert report.windows[0].resets_at is not None
+    assert report.windows[1].resets_at is None
+
+
+def test_claude_live_payload_reports_empty_sub_pools_explicitly() -> None:
+    """Absent per-model data must be stated, not silently omitted."""
+    report = _resolve_claude(CLAUDE_LIVE)
+    facts = dict(report.facts)
+    assert "none active" in facts["Sub-pools"]
+    assert "seven_day_opus" in " ".join(report.notes)
+    assert "nimbus_quill" in " ".join(report.notes)
+    assert "Sub-pools: none active" in cu.SummaryFormatter().render([report])
+
+
+def test_claude_live_payload_extra_usage_disabled() -> None:
+    """`is_enabled: false` must read as off, not be missed because the key is `enabled`."""
+    report = _resolve_claude(CLAUDE_LIVE)
+    assert dict(report.facts)["Extra credits"] == "off"
+
+
+def test_claude_extra_usage_enabled_with_credits() -> None:
+    payload = dict(CLAUDE_LIVE)
+    payload["extra_usage"] = {
+        "is_enabled": True,
+        "monthly_limit": 50.0,
+        "used_credits": 3.4,
+        "utilization": 6.8,
+        "currency": "USD",
+    }
+    report = _resolve_claude(payload)
+    assert dict(report.facts)["Extra credits"] == "$3.40 / $50.00"
+
+
+def test_claude_limits_array_surfaces_active_sub_pool() -> None:
+    """A populated per-model pool is reported generically, whatever the model is."""
+    payload = dict(CLAUDE_LIVE)
+    payload["limits"] = list(CLAUDE_LIVE["limits"]) + [
+        {
+            "kind": "weekly_opus",
+            "group": "weekly",
+            "percent": 38,
+            "severity": "normal",
+            "resets_at": "2026-08-21T10:00:00Z",
+            "scope": None,
+            "is_active": True,
+        }
+    ]
+    report = _resolve_claude(payload)
+    assert _windows(report) == {"5h": 5.0, "7d": 45.0, "Opus 7d": 38.0}
+    assert "Sub-pools" not in dict(report.facts)
+
+
+def test_claude_limits_array_uses_scope_when_present() -> None:
+    payload = dict(CLAUDE_LIVE)
+    payload["limits"] = list(CLAUDE_LIVE["limits"]) + [
+        {
+            "kind": "weekly_model",
+            "group": "weekly",
+            "percent": 12,
+            "scope": "claude-fable-5",
+            "is_active": True,
+        }
+    ]
+    report = _resolve_claude(payload)
+    assert _windows(report)["Fable 7d"] == 12.0
+
+
+def test_claude_zero_inactive_sub_pool_is_not_shown() -> None:
+    """An untouched pool at 0% would be noise in a one-line summary."""
+    payload = dict(CLAUDE_LIVE)
+    payload["limits"] = list(CLAUDE_LIVE["limits"]) + [
+        {"kind": "weekly_opus", "group": "weekly", "percent": 0, "is_active": False}
+    ]
+    report = _resolve_claude(payload)
+    assert "Opus 7d" not in _windows(report)
 
 
 def test_claude_valid_access_token_is_never_refreshed() -> None:

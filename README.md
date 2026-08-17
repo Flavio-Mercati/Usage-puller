@@ -160,14 +160,30 @@ Then it queries, in order:
   `CLAUDE_ORG_ID` is set — a fallback for when the first endpoint changes)
 
 Parsed out of the response: the 5-hour rolling window percentage and reset time, the
-7-day cap percentage, the **Claude Fable 5** sub-pool at both 5h and 7d, and extra
-pay-as-you-go credit usage when the account has it enabled.
+7-day cap percentage, any populated per-model sub-pool, and extra pay-as-you-go credit
+usage when the account has it enabled.
 
-> **On payload shapes.** Anthropic has shipped more than one field layout for this
-> endpoint (`five_hour` / `session`, `utilization` / `used_percent`, dedicated
-> `*_fable` keys / a `model_limits` collection). The parser accepts all of these and
-> reports `Status: PARTIAL` if it recognises none — see
-> [Troubleshooting](#troubleshooting) if you land there.
+The authoritative structure is the `limits` array, which is self-describing:
+
+```json
+{"kind": "session",     "group": "session", "percent": 5,  "resets_at": "...", "scope": null},
+{"kind": "weekly_all",  "group": "weekly",  "percent": 45, "resets_at": "...", "scope": null},
+{"kind": "weekly_opus", "group": "weekly",  "percent": 38, "is_active": true}
+```
+
+`kind: session` and `kind: weekly_all` become the `5h` and `7d` lines. Anything else is
+treated as a **per-model sub-pool** and labelled from its `scope` or `kind` — so
+`weekly_opus` renders as `Opus 7d`, and a pool scoped to `claude-fable-5` renders as
+`Fable 7d`. Nothing is hard-coded to one model. The older flat layout
+(`five_hour` / `seven_day` objects) is still parsed as a fallback.
+
+> **On sub-pools.** The endpoint also returns per-model slots as top-level keys —
+> `seven_day_opus`, `seven_day_sonnet`, `seven_day_cowork`, plus codenamed slots — and on
+> many accounts every one of them is `null`. When that happens you get an explicit
+> `Sub-pools: none active (N reported empty)` rather than a silently missing line, so a
+> blank is never ambiguous between "no usage" and "parser missed it". A **Claude Fable**
+> pool only appears if Anthropic emits one for your account; at time of writing it is not
+> among the keys returned.
 
 ### OpenAI Codex
 

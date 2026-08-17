@@ -1116,27 +1116,142 @@ class ClaudeResolver(QuotaResolver):
         report = ProviderReport(provider=self.provider, label=self.label, source=endpoint)
         report.raw = payload if isinstance(payload, dict) else {"payload": payload}
 
-        five_hour = self._window("5h", payload, self.FIVE_HOUR_ALIASES, exclude=self.FABLE_HINTS)
-        seven_day = self._window("7d", payload, self.SEVEN_DAY_ALIASES, exclude=self.FABLE_HINTS)
-        fable_5h = self._sub_pool_window("Fable 5h", payload, self.FIVE_HOUR_ALIASES)
-        fable_7d = self._sub_pool_window("Fable 7d", payload, self.SEVEN_DAY_ALIASES)
+        # Preferred source: the self-describing `limits` array. Fall back to the flat
+        # `five_hour` / `seven_day` keys when it is absent.
+        windows = self._windows_from_limits(payload)
+        if not windows:
+            windows = self._windows_from_flat_keys(payload)
+        else:
+            windows.extend(
+                w
+                for w in self._sub_pool_windows_from_flat_keys(payload)
+                if not any(existing.label == w.label for existing in windows)
+            )
 
-        for window in (five_hour, seven_day, fable_5h, fable_7d):
-            if window is not None and not window.is_empty:
-                # Only the 5-hour session window shows a countdown; four timers in one
-                # line stops being copiable.
-                if window.label != "5h":
-                    window.resets_at = None
-                report.windows.append(window)
+        for window in windows:
+            # Only the 5-hour session window shows a countdown; four timers in one
+            # line stops being copiable.
+            if window.label != "5h":
+                window.resets_at = None
+            report.windows.append(window)
 
         extra = self._extra_credits(payload)
         if extra:
             report.facts.append(("Extra credits", extra))
 
+        empty_pools = self._empty_sub_pool_names(payload)
+        if empty_pools and not any(
+            w.label not in ("5h", "7d") for w in report.windows
+        ):
+            # Answers "why is there no per-model line?" without inventing a number.
+            report.facts.append(("Sub-pools", f"none active ({len(empty_pools)} reported empty)"))
+            report.notes.append("empty sub-pools: " + ", ".join(sorted(empty_pools)))
+
         if not report.windows:
             report.status = STATUS_PARTIAL
             report.message = "usage payload had no recognisable 5h/7d window"
         return report
+
+    # -- `limits[]` parsing ------------------------------------------------------------
+
+    # Kinds that represent the account-wide windows rather than a per-model sub-pool.
+    # Keys are pre-normalised (lowercase, alphanumeric only) to match normalise_key().
+    PRIMARY_LIMIT_KINDS = {
+        "session": "5h",
+        "weeklyall": "7d",
+        "weekly": "7d",
+        "sevenday": "7d",
+        "fivehour": "5h",
+    }
+
+    def _windows_from_limits(self, payload: Any) -> List[Window]:
+        """Parse the ``limits`` array: ``{kind, group, percent, resets_at, scope}``."""
+        limits = payload.get("limits") if isinstance(payload, dict) else None
+        if not isinstance(limits, list):
+            return []
+        windows: List[Window] = []
+        for entry in limits:
+            if not isinstance(entry, dict):
+                continue
+            percent = coerce_percent(
+                entry.get("percent", entry.get("utilization")), "percent"
+            )
+            if percent is None:
+                continue
+            kind = str(entry.get("kind") or "")
+            label = self.PRIMARY_LIMIT_KINDS.get(normalise_key(kind))
+            if label is None:
+                label = self._sub_pool_label(kind, entry.get("group"), entry.get("scope"))
+                # A sub-pool sitting at zero with no activity is noise in a one-line
+                # summary; the account-wide windows always show.
+                if not percent and not entry.get("is_active"):
+                    continue
+            if any(w.label == label for w in windows):
+                continue
+            windows.append(
+                Window(
+                    label=label,
+                    percent=percent,
+                    resets_at=parse_timestamp(entry.get("resets_at")),
+                )
+            )
+        windows.sort(key=lambda w: (w.label not in ("5h", "7d"), w.label != "5h"))
+        return windows
+
+    @staticmethod
+    def _sub_pool_label(kind: str, group: Any, scope: Any) -> str:
+        """Turn ``weekly_opus`` / ``scope=claude-fable-5`` into ``Opus 7d`` / ``Fable 7d``."""
+        window = {"session": "5h", "weekly": "7d"}.get(str(group or "").lower(), "")
+        name = str(scope or kind or "pool")
+        for prefix in ("weekly_", "session_", "seven_day_", "five_hour_"):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                window = window or ("7d" if "weekly" in prefix or "seven" in prefix else "5h")
+        name = name.replace("claude-", "").replace("-", " ").replace("_", " ").strip()
+        # Drop a trailing version digit: "fable 5" -> "Fable".
+        parts = [p for p in name.split() if not p.isdigit()]
+        pretty = " ".join(p.capitalize() for p in parts) or "Pool"
+        return f"{pretty} {window}".strip()
+
+    def _windows_from_flat_keys(self, payload: Any) -> List[Window]:
+        """Legacy shape: top-level ``five_hour`` / ``seven_day`` objects."""
+        windows: List[Window] = []
+        five = self._window("5h", payload, self.FIVE_HOUR_ALIASES, exclude=self.FABLE_HINTS)
+        seven = self._window("7d", payload, self.SEVEN_DAY_ALIASES, exclude=self.FABLE_HINTS)
+        for window in (five, seven):
+            if window is not None and not window.is_empty:
+                windows.append(window)
+        windows.extend(self._sub_pool_windows_from_flat_keys(payload))
+        return windows
+
+    def _sub_pool_windows_from_flat_keys(self, payload: Any) -> List[Window]:
+        windows: List[Window] = []
+        for label, aliases in (
+            ("Fable 5h", self.FIVE_HOUR_ALIASES),
+            ("Fable 7d", self.SEVEN_DAY_ALIASES),
+        ):
+            window = self._sub_pool_window(label, payload, aliases)
+            if window is not None and not window.is_empty:
+                windows.append(window)
+        return windows
+
+    @staticmethod
+    def _empty_sub_pool_names(payload: Any) -> List[str]:
+        """Top-level per-model pool keys that exist but carry no data."""
+        if not isinstance(payload, dict):
+            return []
+        names = []
+        for key, value in payload.items():
+            lowered = str(key).lower()
+            if lowered in ("five_hour", "seven_day", "limits", "extra_usage"):
+                continue
+            if value is None or (
+                isinstance(value, dict)
+                and value.get("utilization") in (None, 0, 0.0)
+                and ("resets_at" in value or "utilization" in value)
+            ):
+                names.append(str(key))
+        return names
 
     def _window(
         self,
@@ -1279,20 +1394,33 @@ class ClaudeResolver(QuotaResolver):
                 return format_money(float(block))
             if not isinstance(block, dict):
                 continue
-            enabled = block.get("enabled")
+            # Real payloads use `is_enabled`; older/other shapes use `enabled`.
+            enabled = block.get("is_enabled")
+            if enabled is None:
+                enabled = block.get("enabled")
             if enabled is False:
                 return "off"
             used = coerce_float(
-                first_key(block, ("used_usd", "usedUsd", "amount_used", "used", "spent"))
+                first_key(
+                    block,
+                    ("used_credits", "used_usd", "usedUsd", "amount_used", "used", "spent"),
+                )
             )
             limit = coerce_float(
-                first_key(block, ("limit_usd", "limitUsd", "limit", "cap", "budget"))
+                first_key(
+                    block,
+                    ("monthly_limit", "limit_usd", "limitUsd", "limit", "cap", "budget"),
+                )
             )
+            percent = coerce_percent(block.get("utilization"), "utilization")
             if used is None and limit is None:
+                if percent is not None:
+                    return f"{format_percent(percent)} used"
                 return "ENABLED" if enabled else None
-            rendered = format_money(used)
+            currency = "$" if str(block.get("currency") or "USD").upper() == "USD" else ""
+            rendered = format_money(used, currency)
             if limit:
-                rendered += f" / {format_money(limit)}"
+                rendered += f" / {format_money(limit, currency)}"
             return rendered
         return None
 
