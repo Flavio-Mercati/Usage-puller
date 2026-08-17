@@ -8,7 +8,7 @@ Covers three providers in one shot:
 
 | Provider | What is reported | Auth mechanism |
 | --- | --- | --- |
-| **Anthropic Claude Code** | 5-hour session window + reset timer, 7-day weekly cap, Claude Fable 5 sub-pool (5h and 7d), pay-as-you-go extra credits | CLI OAuth token |
+| **Anthropic Claude Code** | 5-hour session window + reset timer, 7-day weekly cap, any scoped per-model pool (e.g. Fable) with its severity flag, pay-as-you-go extra credits | CLI OAuth token |
 | **OpenAI Codex** | Month-to-date spend against the hard limit, plan, rolling request/token allowance | API key |
 | **Google Antigravity (`agy`)** | Daily tier, Vertex AI quota consumption, AI Platform enablement state | GCP service account or ADC |
 
@@ -16,8 +16,8 @@ Covers three providers in one shot:
 =================================================================
            AI ASSISTANT QUOTA SUMMARY (2026-08-17 09:12 UTC)
 =================================================================
-[Claude Code]  5h: 24% (resets 2h 10m) | 7d: 62% | Fable 5h: 12%
-               Fable 7d: 38% | Extra credits: $3.40 / $50.00
+[Claude Code]  5h: 2% (resets 8h 49m) | 7d: 47% (resets 3d 22h)
+               Fable 7d: 81% (warning) | Extra credits: off
 [OpenAI Codex] Limit Used: 42.5% | Spent: $42.50 / $100.00
                Plan: Pay-as-you-go | Requests: 0.1% used
 [Antigravity]  Daily Tier: Normal
@@ -171,19 +171,36 @@ The authoritative structure is the `limits` array, which is self-describing:
 {"kind": "weekly_opus", "group": "weekly",  "percent": 38, "is_active": true}
 ```
 
-`kind: session` and `kind: weekly_all` become the `5h` and `7d` lines. Anything else is
-treated as a **per-model sub-pool** and labelled from its `scope` or `kind` — so
-`weekly_opus` renders as `Opus 7d`, and a pool scoped to `claude-fable-5` renders as
-`Fable 7d`. Nothing is hard-coded to one model. The older flat layout
-(`five_hour` / `seven_day` objects) is still parsed as a fallback.
+`kind: session` and `kind: weekly_all` become the `5h` and `7d` lines. Anything else is a
+**scoped sub-pool**, labelled from its `scope` — which is a nested object, not a string:
 
-> **On sub-pools.** The endpoint also returns per-model slots as top-level keys —
-> `seven_day_opus`, `seven_day_sonnet`, `seven_day_cowork`, plus codenamed slots — and on
-> many accounts every one of them is `null`. When that happens you get an explicit
-> `Sub-pools: none active (N reported empty)` rather than a silently missing line, so a
-> blank is never ambiguous between "no usage" and "parser missed it". A **Claude Fable**
-> pool only appears if Anthropic emits one for your account; at time of writing it is not
-> among the keys returned.
+```json
+{"kind": "weekly_scoped", "group": "weekly", "percent": 81, "severity": "warning",
+ "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+ "is_active": true}
+```
+
+That renders as `Fable 7d: 81% (warning)`. No model name is hard-coded, so any scoped
+pool the provider emits appears automatically — `weekly_opus` becomes `Opus 7d`, a pool
+scoped to Sonnet becomes `Sonnet 7d`. The older flat layout (`five_hour` / `seven_day`
+objects, `seven_day_fable` keys) is still parsed as a fallback.
+
+Three details that matter if you are deliberately pacing a pool:
+
+- **`severity` is surfaced.** The provider's own `warning` / `critical` flag is appended
+  to the percentage, so the cue to change behaviour is visible without arithmetic.
+- **Both countdowns show.** The session reset and the weekly reset each appear once.
+  Every 7d pool shares one weekly reset, so it is not repeated per pool.
+- **`remaining_percent` is in the JSON.** `--json` reports headroom per window alongside
+  the used percentage — the number you want when the goal is to exhaust a pool before it
+  resets.
+
+> **Empty sub-pools.** The endpoint also returns per-model slots as top-level keys
+> (`seven_day_opus`, `seven_day_sonnet`, `seven_day_cowork`, plus codenamed slots), and
+> these are often all `null` even while a scoped pool is live inside `limits[]`. When no
+> sub-pool has data you get an explicit `Sub-pools: none active (N reported empty)`
+> rather than a silently missing line, so a blank is never ambiguous between "no usage"
+> and "the parser missed it".
 
 ### OpenAI Codex
 
@@ -347,7 +364,7 @@ summary so it is one long-press away from your clipboard.
    =================================================================
               AI ASSISTANT QUOTA SUMMARY (2026-08-17 09:12 UTC)
    =================================================================
-   [Claude Code]  5h: 24% (resets 2h 10m) | 7d: 62% | Fable 5h: 12%
+   [Claude Code]  5h: 2% (resets 8h 49m) | 7d: 47% (resets 3d 22h)
    ...
    ```
 
@@ -494,8 +511,8 @@ clipboard, a terminal, and a Markdown code fence without reflowing:
 =================================================================
            AI ASSISTANT QUOTA SUMMARY (YYYY-MM-DD HH:MM UTC)
 =================================================================
-[Claude Code]  5h: 24% (resets 2h 10m) | 7d: 62% | Fable 5h: 12%
-               Fable 7d: 38%
+[Claude Code]  5h: 2% (resets 8h 49m) | 7d: 47% (resets 3d 22h)
+               Fable 7d: 81% (warning)
 [OpenAI Codex] Limit Used: 18.5% | Spent: $42.50 / $100.00
 [Antigravity]  Daily Tier: Normal | Quota: 15.0% used (AI Platform: ENABLED)
 =================================================================
@@ -523,7 +540,8 @@ simultaneous reset timers stopped being copiable.
       "windows": [
         {"label": "5h", "percent": 24.0, "resets_at": "2026-08-17T11:22:44Z",
          "resets_in_seconds": 7800, "used": null, "limit": null, "unit": null},
-        {"label": "Fable 5h", "percent": 12.0, "resets_at": null}
+        {"label": "Fable 7d", "percent": 81.0, "resets_at": null,
+         "remaining_percent": 19.0, "severity": "warning"}
       ],
       "facts": {"Extra credits": "$3.40 / $50.00", "Plan": "max"},
       "notes": ["credentials: /home/you/.claude/.credentials.json"]
