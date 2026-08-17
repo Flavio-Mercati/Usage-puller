@@ -203,6 +203,143 @@ def test_claude_unrecognised_payload_is_partial() -> None:
     assert "no recognisable" in (report.message or "")
 
 
+def test_claude_valid_access_token_is_never_refreshed() -> None:
+    """A usable access token must not be traded for a new one — that rotation is what
+    invalidated a real user's Keychain credential and logged their Claude CLI out."""
+    os.environ.pop("CLAUDE_REFRESH_TOKEN", None)
+    os.environ["CLAUDE_ACCESS_TOKEN"] = "at-still-good"
+    http = RoutedHttp(_claude_routes(CLAUDE_FLAT))
+    try:
+        report = cu.ClaudeResolver(http).resolve()
+    finally:
+        os.environ.pop("CLAUDE_ACCESS_TOKEN", None)
+    assert report.status == cu.STATUS_OK, report.message
+    assert not any("oauth/token" in call for call in http.calls), http.calls
+
+
+def test_claude_keychain_refresh_refused_by_default() -> None:
+    """Refreshing a Keychain credential cannot be persisted, so it must be refused."""
+    for name in ("CLAUDE_REFRESH_TOKEN", "CLAUDE_ACCESS_TOKEN"):
+        os.environ.pop(name, None)
+    resolver = cu.ClaudeResolver(RoutedHttp(_claude_routes(CLAUDE_FLAT)))
+    resolver.load_credentials = lambda: cu.ClaudeCredentials(  # type: ignore[method-assign]
+        access_token="at-expired",
+        refresh_token="rt-keychain",
+        expires_at=cu.utcnow() - timedelta(hours=1),
+        source="macOS keychain",
+        source_kind="keychain",
+    )
+    report = resolver.resolve()
+    assert report.status == cu.STATUS_UNCONFIGURED
+    assert "Keychain" in (report.message or "")
+    assert "claude -p ok" in (report.message or "")
+
+
+def test_claude_keychain_refresh_allowed_with_override() -> None:
+    for name in ("CLAUDE_REFRESH_TOKEN", "CLAUDE_ACCESS_TOKEN"):
+        os.environ.pop(name, None)
+    resolver = cu.ClaudeResolver(
+        RoutedHttp(_claude_routes(CLAUDE_FLAT)),
+        options=cu.RunOptions(refresh_mode="always"),
+    )
+    resolver.load_credentials = lambda: cu.ClaudeCredentials(  # type: ignore[method-assign]
+        access_token="at-expired",
+        refresh_token="rt-keychain",
+        expires_at=cu.utcnow() - timedelta(hours=1),
+        source="macOS keychain",
+        source_kind="keychain",
+    )
+    report = resolver.resolve()
+    assert report.status == cu.STATUS_OK, report.message
+
+
+def test_claude_no_refresh_mode_refuses_env_refresh() -> None:
+    os.environ["CLAUDE_REFRESH_TOKEN"] = "rt-test"
+    os.environ.pop("CLAUDE_ACCESS_TOKEN", None)
+    report = cu.ClaudeResolver(
+        RoutedHttp(_claude_routes(CLAUDE_FLAT)),
+        options=cu.RunOptions(refresh_mode="never"),
+    ).resolve()
+    assert report.status == cu.STATUS_UNCONFIGURED
+    assert "--no-refresh" in (report.message or "")
+
+
+def test_claude_rotated_token_persisted_to_file(tmp_path: Any) -> None:
+    """A rotated refresh token must be written back, preserving unrelated fields."""
+    for name in ("CLAUDE_REFRESH_TOKEN", "CLAUDE_ACCESS_TOKEN"):
+        os.environ.pop(name, None)
+    path = Path(tmp_path) / ".credentials.json"
+    path.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "at-old",
+                    "refreshToken": "rt-old",
+                    "expiresAt": 1000,
+                    "subscriptionType": "max",
+                    "scopes": ["user:inference"],
+                },
+                "unrelatedTopLevel": {"keep": True},
+            }
+        )
+    )
+    os.environ["CLAUDE_CREDENTIALS_PATH"] = str(path)
+    routes = {
+        "oauth/token": (
+            200,
+            {"access_token": "at-new", "refresh_token": "rt-new", "expires_in": 3600},
+        ),
+        "oauth/usage": (200, CLAUDE_FLAT),
+    }
+    try:
+        report = cu.ClaudeResolver(RoutedHttp(routes)).resolve()
+    finally:
+        os.environ.pop("CLAUDE_CREDENTIALS_PATH", None)
+
+    assert report.status == cu.STATUS_OK, report.message
+    written = json.loads(path.read_text())
+    assert written["claudeAiOauth"]["refreshToken"] == "rt-new"
+    assert written["claudeAiOauth"]["accessToken"] == "at-new"
+    assert written["claudeAiOauth"]["subscriptionType"] == "max"
+    assert written["claudeAiOauth"]["scopes"] == ["user:inference"]
+    assert written["unrelatedTopLevel"] == {"keep": True}
+    assert written["claudeAiOauth"]["expiresAt"] > 1000
+    assert any("persisted" in note for note in report.notes), report.notes
+    assert not list(Path(tmp_path).glob("*.tmp"))
+
+
+def test_claude_rotated_env_token_warns_secret_is_stale() -> None:
+    os.environ["CLAUDE_REFRESH_TOKEN"] = "rt-old"
+    os.environ.pop("CLAUDE_ACCESS_TOKEN", None)
+    routes = {
+        "oauth/token": (200, {"access_token": "at-new", "refresh_token": "rt-new"}),
+        "oauth/usage": (200, CLAUDE_FLAT),
+    }
+    report = cu.ClaudeResolver(RoutedHttp(routes)).resolve()
+    assert report.status == cu.STATUS_OK, report.message
+    assert any("stale" in note for note in report.notes), report.notes
+
+
+def test_claude_unrotated_refresh_writes_nothing(tmp_path: Any) -> None:
+    """If the provider does not rotate, the credential file must be left untouched."""
+    for name in ("CLAUDE_REFRESH_TOKEN", "CLAUDE_ACCESS_TOKEN"):
+        os.environ.pop(name, None)
+    path = Path(tmp_path) / "creds-norotate.json"
+    original = json.dumps({"claudeAiOauth": {"refreshToken": "rt-old", "expiresAt": 1000}})
+    path.write_text(original)
+    os.environ["CLAUDE_CREDENTIALS_PATH"] = str(path)
+    routes = {
+        "oauth/token": (200, {"access_token": "at-new"}),
+        "oauth/usage": (200, CLAUDE_FLAT),
+    }
+    try:
+        report = cu.ClaudeResolver(RoutedHttp(routes)).resolve()
+    finally:
+        os.environ.pop("CLAUDE_CREDENTIALS_PATH", None)
+    assert report.status == cu.STATUS_OK, report.message
+    assert path.read_text() == original
+
+
 def test_claude_unconfigured_when_no_credentials(tmp_path: Any = None) -> None:
     for name in ("CLAUDE_REFRESH_TOKEN", "CLAUDE_ACCESS_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
         os.environ.pop(name, None)

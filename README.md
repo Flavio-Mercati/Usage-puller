@@ -136,6 +136,14 @@ HTML interstitial instead of JSON. This project instead uses **the same OAuth to
 `claude` CLI uses**, against `api.anthropic.com` — a plain JSON API with no challenge
 layer.
 
+> **The tool will not rotate your login.** Anthropic rotates refresh tokens: exchanging
+> one issues a replacement and invalidates the old. A quota checker that refreshed
+> carelessly would therefore log the `claude` CLI out. So: a valid access token is
+> **never** traded for a new one; when a refresh is unavoidable, the replacement is
+> written back to the credential file; and a Keychain-stored credential — which cannot
+> be rewritten safely from here — is **refused** rather than consumed. See
+> [Token safety](#token-safety).
+
 The resolver walks this chain and stops at the first success:
 
 1. `CLAUDE_ACCESS_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN` (short-lived; used directly)
@@ -419,6 +427,10 @@ If you run this behind an egress allowlist, permit these hosts:
 --raw                  include raw provider payloads in JSON output
 --width N              ASCII block width (default 65)
 --github-summary[=PATH]  append the block to $GITHUB_STEP_SUMMARY (or PATH)
+--no-refresh           never exchange a refresh token; read-only against whatever
+                       access token already exists
+--allow-refresh        refresh even when the rotated token cannot be written back
+                       (may log the Claude CLI out — see Token safety)
 --strict               exit 1 if any selected provider is unconfigured or errored
 --strict-schema        validate the output payload and report violations on stderr
 --env-file PATH        load variables from a .env file first
@@ -541,6 +553,38 @@ Specifically handled:
 
 ---
 
+## Token safety
+
+Anthropic's OAuth refresh tokens **rotate**: exchanging one returns a replacement and
+invalidates the token you presented. A naive quota checker that refreshes on every run,
+discarding the replacement, will silently invalidate the credential store the `claude`
+CLI reads — and the next `claude` command fails with
+`OAuth session expired and could not be refreshed`.
+
+This happened during development, on a real account, which is why the behaviour below is
+enforced rather than merely documented.
+
+| Credential source | Behaviour when the access token is still valid | Behaviour when it has expired |
+| --- | --- | --- |
+| Any | Used as-is. **No refresh is attempted.** | see below |
+| `CLAUDE_ACCESS_TOKEN` env | Used as-is | Reported as an error; nothing to refresh with |
+| `CLAUDE_REFRESH_TOKEN` env (CI) | n/a | Refreshed. If the provider rotates, a `WARNING` note says the stored secret is now stale |
+| `~/.claude/.credentials.json` | Used as-is | Refreshed, and the rotated token is **written back atomically**, preserving every unrelated field and re-applying mode `600` |
+| macOS Keychain | Used as-is | **Refused.** The Keychain cannot be rewritten safely from here, so consuming the token would log the CLI out. Run `claude -p ok` to let the CLI refresh it, then retry |
+
+Two flags control this:
+
+- `--no-refresh` — never refresh under any circumstance. The safest mode for a monitoring
+  cron job: it can only read a token that already exists.
+- `--allow-refresh` — override the Keychain refusal. Only use this if you accept
+  re-running `claude` to log back in afterwards.
+
+If you are ever logged out by a token rotation, the recovery is simply to re-authenticate:
+
+```bash
+claude
+```
+
 ## Security notes
 
 - **Nothing is transmitted anywhere except the three providers' own APIs.** There is no
@@ -597,8 +641,21 @@ Run `claude` once and log in, then re-run `extract_tokens.py`. On macOS the cred
 may live in the Keychain rather than a file — the resolver checks both.
 
 **`[Claude Code] Status: ERROR (HTTP 400: refresh token expired)`**
-Refresh tokens rotate when you re-authenticate the CLI. Re-run `extract_tokens.py
---reveal` and update the `CLAUDE_REFRESH_TOKEN` secret.
+Refresh tokens rotate on use. Re-run `extract_tokens.py --reveal` and update the
+`CLAUDE_REFRESH_TOKEN` secret with the current value. See [Token safety](#token-safety).
+
+**`Status: UNCONFIGURED (access token in the macOS Keychain has expired ...)`**
+Working as designed — refreshing it here would log your `claude` CLI out. Let the CLI
+refresh its own token, then retry:
+
+```bash
+claude -p "ok" && python3 check_usage.py --only claude
+```
+
+**`claude` itself says `OAuth session expired and could not be refreshed`**
+Your refresh token was consumed without the replacement being stored. Re-authenticate
+with `claude`. Versions of this tool before the Keychain refusal could cause this; it
+cannot happen now unless you pass `--allow-refresh`.
 
 **`[Claude Code] Status: PARTIAL (usage payload had no recognisable 5h/7d window)`**
 The endpoint returned data in a layout the parser does not know. Run

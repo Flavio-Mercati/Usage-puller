@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
 import json
 import os
 import subprocess
@@ -674,9 +675,15 @@ class QuotaResolver(ABC):
     provider: str = "provider"
     label: str = "Provider"
 
-    def __init__(self, http: HttpClient, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        http: HttpClient,
+        verbose: bool = False,
+        options: Optional[RunOptions] = None,
+    ) -> None:
         self.http = http
         self.verbose = verbose
+        self.options = options or RunOptions()
 
     @abstractmethod
     def fetch(self) -> ProviderReport:
@@ -718,6 +725,15 @@ class ClaudeCredentials:
     expires_at: Optional[datetime] = None
     subscription: Optional[str] = None
     source: str = "unknown"
+    # How the credential was obtained, which decides whether refreshing it is safe:
+    # "env" (nothing local to break), "file" (can be written back), "keychain"
+    # (cannot be written back safely, so refreshing would desync the Claude CLI).
+    source_kind: str = "unknown"
+    source_path: Optional[Path] = None
+    # Full document and the key that held the OAuth blob, preserved so a rotated
+    # token can be written back without discarding unrelated fields.
+    document: Optional[Dict[str, Any]] = None
+    container_key: Optional[str] = None
 
     @property
     def access_token_valid(self) -> bool:
@@ -726,6 +742,30 @@ class ClaudeCredentials:
         if self.expires_at is None:
             return True
         return self.expires_at - utcnow() > timedelta(seconds=120)
+
+
+@dataclass
+class TokenRefresh:
+    """Result of an OAuth refresh exchange."""
+
+    access_token: str
+    refresh_token: Optional[str] = None
+    expires_at: Optional[datetime] = None
+
+    @property
+    def rotated(self) -> bool:
+        """True when the provider issued a replacement refresh token."""
+        return bool(self.refresh_token)
+
+
+@dataclass
+class RunOptions:
+    """Cross-provider run policy."""
+
+    # "auto"  - refresh only when it is safe (env source, or a file we can update)
+    # "never" - never refresh; read-only against whatever token already exists
+    # "always"- refresh even when the rotated token cannot be persisted
+    refresh_mode: str = "auto"
 
 
 class ClaudeResolver(QuotaResolver):
@@ -794,8 +834,13 @@ class ClaudeResolver(QuotaResolver):
     )
     FABLE_HINTS = ("fable",)
 
-    def __init__(self, http: HttpClient, verbose: bool = False) -> None:
-        super().__init__(http, verbose)
+    def __init__(
+        self,
+        http: HttpClient,
+        verbose: bool = False,
+        options: Optional[RunOptions] = None,
+    ) -> None:
+        super().__init__(http, verbose, options)
         self.api_base = (
             env("ANTHROPIC_USAGE_BASE_URL", default=ANTHROPIC_API_BASE) or ANTHROPIC_API_BASE
         )
@@ -811,12 +856,17 @@ class ClaudeResolver(QuotaResolver):
         if access or refresh:
             self.log("using credentials from environment")
             return ClaudeCredentials(
-                access_token=access, refresh_token=refresh, source="environment"
+                access_token=access,
+                refresh_token=refresh,
+                source="environment",
+                source_kind="env",
             )
 
         for candidate in self._credential_files():
             payload = read_json_file(candidate)
-            creds = self._parse_credential_payload(payload, source=str(candidate))
+            creds = self._parse_credential_payload(
+                payload, source=str(candidate), source_kind="file", source_path=candidate
+            )
             if creds is not None:
                 self.log(f"using credentials from {candidate}")
                 return creds
@@ -836,11 +886,20 @@ class ClaudeResolver(QuotaResolver):
         return existing_paths(candidates)
 
     def _parse_credential_payload(
-        self, payload: Any, source: str
+        self,
+        payload: Any,
+        source: str,
+        source_kind: str = "unknown",
+        source_path: Optional[Path] = None,
     ) -> Optional[ClaudeCredentials]:
         if not isinstance(payload, dict):
             return None
-        blob = payload.get("claudeAiOauth") or payload.get("claude_ai_oauth") or payload
+        container_key: Optional[str] = None
+        for key in ("claudeAiOauth", "claude_ai_oauth"):
+            if isinstance(payload.get(key), dict):
+                container_key = key
+                break
+        blob = payload[container_key] if container_key else payload
         if not isinstance(blob, dict):
             return None
         access = blob.get("accessToken") or blob.get("access_token")
@@ -853,6 +912,10 @@ class ClaudeResolver(QuotaResolver):
             expires_at=parse_timestamp(blob.get("expiresAt") or blob.get("expires_at")),
             subscription=blob.get("subscriptionType") or blob.get("subscription_type"),
             source=source,
+            source_kind=source_kind,
+            source_path=source_path,
+            document=payload,
+            container_key=container_key,
         )
 
     def _read_macos_keychain(self) -> Optional[ClaudeCredentials]:
@@ -874,10 +937,17 @@ class ClaudeResolver(QuotaResolver):
             payload = json.loads(raw.stdout)
         except ValueError:
             return None
-        return self._parse_credential_payload(payload, source="macos-keychain")
+        return self._parse_credential_payload(
+            payload, source="macOS keychain", source_kind="keychain"
+        )
 
-    def refresh_access_token(self, refresh_token: str) -> str:
-        """Exchange a refresh token for a short-lived access token."""
+    def refresh_access_token(self, refresh_token: str) -> TokenRefresh:
+        """Exchange a refresh token for a short-lived access token.
+
+        The response's ``refresh_token`` is returned rather than discarded: Anthropic
+        rotates refresh tokens, so dropping the replacement invalidates the credential
+        store and breaks the Claude CLI's own login.
+        """
         response = self.http.post(
             ANTHROPIC_OAUTH_TOKEN_URL,
             json_body={
@@ -901,18 +971,33 @@ class ClaudeResolver(QuotaResolver):
         token = payload.get("access_token")
         if not isinstance(token, str) or not token:
             raise HttpError("token refresh returned no access_token", status=response.status)
-        return token
+        rotated = payload.get("refresh_token")
+        expires_in = coerce_float(payload.get("expires_in"))
+        return TokenRefresh(
+            access_token=token,
+            refresh_token=rotated if isinstance(rotated, str) and rotated else None,
+            expires_at=(
+                utcnow() + timedelta(seconds=expires_in) if expires_in else None
+            ),
+        )
 
     # -- fetch -------------------------------------------------------------------------
 
     def fetch(self) -> ProviderReport:
         creds = self.load_credentials()
+        extra_notes: List[str] = []
+
         if creds.access_token_valid:
+            # Preferred path: a usable access token is never traded for a new one, so a
+            # read-only quota check cannot rotate the credential out from under the CLI.
             token = creds.access_token
             assert token is not None
         elif creds.refresh_token:
-            self.log("access token missing or expired, refreshing")
-            token = self.refresh_access_token(creds.refresh_token)
+            self._guard_refresh(creds)
+            self.log(f"access token missing or expired, refreshing ({creds.source_kind})")
+            refreshed = self.refresh_access_token(creds.refresh_token)
+            token = refreshed.access_token
+            extra_notes.extend(self._persist_refresh(creds, refreshed))
         elif creds.access_token:
             token = creds.access_token  # expired but no refresh token: try anyway
         else:
@@ -921,9 +1006,82 @@ class ClaudeResolver(QuotaResolver):
         payload, endpoint = self._request_usage(token)
         report = self._build_report(payload, endpoint)
         report.notes.append(f"credentials: {creds.source}")
+        report.notes.extend(extra_notes)
         if creds.subscription:
             report.facts.append(("Plan", str(creds.subscription)))
         return report
+
+    def _guard_refresh(self, creds: ClaudeCredentials) -> None:
+        """Refuse to refresh when the rotated token could not be written back.
+
+        Anthropic rotates refresh tokens, and a rotation that cannot be persisted
+        invalidates the store the Claude CLI reads — logging the user out. Env-var
+        credentials have no local store to damage, and a credentials *file* can be
+        updated, but the macOS Keychain cannot be rewritten safely from here.
+        """
+        mode = self.options.refresh_mode
+        if mode == "never":
+            raise ConfigurationError(
+                "access token expired and --no-refresh was given "
+                "(run `claude` to refresh it, or drop --no-refresh)"
+            )
+        if mode == "always":
+            return
+        if creds.source_kind == "keychain":
+            raise ConfigurationError(
+                "access token in the macOS Keychain has expired. Refreshing it here "
+                "would rotate the token without updating the Keychain and log the "
+                "Claude CLI out, so it is refused. Run `claude -p ok` to let the CLI "
+                "refresh it, then retry (or pass --allow-refresh to override)"
+            )
+
+    def _persist_refresh(
+        self, creds: ClaudeCredentials, refreshed: TokenRefresh
+    ) -> List[str]:
+        """Write a rotated refresh token back to its source; return notes for the report."""
+        if not refreshed.rotated:
+            return []
+        if creds.source_kind == "env":
+            return [
+                "WARNING: the refresh token was rotated by the provider. The value in "
+                "CLAUDE_REFRESH_TOKEN is now stale — update the secret with a fresh one "
+                "from `extract_tokens.py`"
+            ]
+        if creds.source_kind != "file" or creds.source_path is None:
+            return [
+                "WARNING: the refresh token was rotated but could not be persisted "
+                f"({creds.source_kind}); the stored credential is now stale"
+            ]
+        try:
+            self._write_credential_file(creds, refreshed)
+        except OSError as exc:
+            return [
+                "WARNING: the refresh token was rotated but writing it back to "
+                f"{creds.source_path} failed ({exc}); re-run `claude` to re-authenticate"
+            ]
+        return [f"rotated refresh token persisted to {creds.source_path}"]
+
+    def _write_credential_file(
+        self, creds: ClaudeCredentials, refreshed: TokenRefresh
+    ) -> None:
+        """Atomically update the credential file, preserving every unrelated field."""
+        document = json.loads(json.dumps(creds.document or {}))
+        blob = document[creds.container_key] if creds.container_key else document
+        camel = "accessToken" in blob or "refreshToken" in blob
+        blob["accessToken" if camel else "access_token"] = refreshed.access_token
+        blob["refreshToken" if camel else "refresh_token"] = refreshed.refresh_token
+        if refreshed.expires_at is not None:
+            key = "expiresAt" if camel else "expires_at"
+            blob[key] = int(refreshed.expires_at.timestamp() * 1000)
+
+        target = creds.source_path
+        assert target is not None
+        temp = target.with_name(target.name + ".usage-puller.tmp")
+        temp.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        with contextlib.suppress(OSError):  # best effort on filesystems without modes
+            os.chmod(temp, 0o600)
+        os.replace(temp, target)
+        self.log(f"persisted rotated refresh token to {target}")
 
     def _request_usage(self, token: str) -> Tuple[Any, str]:
         headers = {
@@ -1153,8 +1311,13 @@ class CodexResolver(QuotaResolver):
     provider = "codex"
     label = "OpenAI Codex"
 
-    def __init__(self, http: HttpClient, verbose: bool = False) -> None:
-        super().__init__(http, verbose)
+    def __init__(
+        self,
+        http: HttpClient,
+        verbose: bool = False,
+        options: Optional[RunOptions] = None,
+    ) -> None:
+        super().__init__(http, verbose, options)
         self.api_base = (
             env("OPENAI_BASE_URL", default=OPENAI_API_BASE) or OPENAI_API_BASE
         ).rstrip("/")
@@ -1344,8 +1507,13 @@ class AntigravityResolver(QuotaResolver):
     QUOTA_USAGE_METRIC = "serviceruntime.googleapis.com/quota/rate/net_usage"
     QUOTA_LIMIT_METRIC = "serviceruntime.googleapis.com/quota/limit"
 
-    def __init__(self, http: HttpClient, verbose: bool = False) -> None:
-        super().__init__(http, verbose)
+    def __init__(
+        self,
+        http: HttpClient,
+        verbose: bool = False,
+        options: Optional[RunOptions] = None,
+    ) -> None:
+        super().__init__(http, verbose, options)
         self.project_id = env("GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT")
         self.tier_override = env("AGY_TIER_OVERRIDE")
         self.lookback_hours = int(coerce_float(env("AGY_LOOKBACK_HOURS", default="24")) or 24)
@@ -1758,7 +1926,7 @@ def validate_schema(payload: Dict[str, Any]) -> List[str]:
 # CLI
 # --------------------------------------------------------------------------------------
 
-RESOLVERS: Dict[str, Callable[[HttpClient, bool], QuotaResolver]] = {
+RESOLVERS: Dict[str, Callable[..., QuotaResolver]] = {
     "claude": ClaudeResolver,
     "codex": CodexResolver,
     "antigravity": AntigravityResolver,
@@ -1813,6 +1981,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         metavar="PATH",
         help="append the block to $GITHUB_STEP_SUMMARY (or PATH)",
+    )
+    parser.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="never exchange a refresh token; read-only against the existing access token",
+    )
+    parser.add_argument(
+        "--allow-refresh",
+        action="store_true",
+        help=(
+            "refresh even when the rotated token cannot be written back "
+            "(may log the Claude CLI out - see README)"
+        ),
     )
     parser.add_argument(
         "--strict",
@@ -1882,12 +2063,16 @@ def load_env_file(path: Optional[str], verbose: bool = False) -> None:
 
 
 def collect_reports(
-    providers: Sequence[str], timeout: float, verbose: bool = False
+    providers: Sequence[str],
+    timeout: float,
+    verbose: bool = False,
+    options: Optional[RunOptions] = None,
 ) -> List[ProviderReport]:
     http = HttpClient(timeout=timeout, verbose=verbose)
+    options = options or RunOptions()
     reports: List[ProviderReport] = []
     for name in providers:
-        resolver = RESOLVERS[name](http, verbose)
+        resolver = RESOLVERS[name](http, verbose, options)
         reports.append(resolver.resolve())
     return reports
 
@@ -1896,7 +2081,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     load_env_file(args.env_file, args.verbose)
     providers = selected_providers(args.only)
-    reports = collect_reports(providers, args.timeout, args.verbose)
+    if args.no_refresh and args.allow_refresh:
+        print("--no-refresh and --allow-refresh are mutually exclusive", file=sys.stderr)
+        return 2
+    refresh_mode = "never" if args.no_refresh else ("always" if args.allow_refresh else "auto")
+    options = RunOptions(refresh_mode=refresh_mode)
+    reports = collect_reports(providers, args.timeout, args.verbose, options)
 
     text = SummaryFormatter(width=args.width).render(reports)
     payload = build_json_payload(reports, include_raw=args.raw)
