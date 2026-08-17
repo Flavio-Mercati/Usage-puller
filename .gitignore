@@ -26,3 +26,6 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Rotated-token scratch file (never committed)
+claude_rotated_token

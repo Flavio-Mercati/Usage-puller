@@ -777,6 +777,10 @@ class RunOptions:
     # "never" - never refresh; read-only against whatever token already exists
     # "always"- refresh even when the rotated token cannot be persisted
     refresh_mode: str = "auto"
+    # Where to write a rotated refresh token that cannot be written back to its own
+    # source (notably CI, where the credential arrives as an environment variable and
+    # the caller must push the replacement into its own secret store).
+    rotated_token_path: Optional[str] = None
 
 
 class ClaudeResolver(QuotaResolver):
@@ -1052,25 +1056,52 @@ class ClaudeResolver(QuotaResolver):
         """Write a rotated refresh token back to its source; return notes for the report."""
         if not refreshed.rotated:
             return []
-        if creds.source_kind == "env":
-            return [
-                "WARNING: the refresh token was rotated by the provider. The value in "
-                "CLAUDE_REFRESH_TOKEN is now stale — update the secret with a fresh one "
-                "from `extract_tokens.py`"
-            ]
-        if creds.source_kind != "file" or creds.source_path is None:
-            return [
-                "WARNING: the refresh token was rotated but could not be persisted "
-                f"({creds.source_kind}); the stored credential is now stale"
-            ]
+
+        # A credential file can be updated in place.
+        if creds.source_kind == "file" and creds.source_path is not None:
+            try:
+                self._write_credential_file(creds, refreshed)
+            except OSError as exc:
+                return [
+                    "WARNING: the refresh token was rotated but writing it back to "
+                    f"{creds.source_path} failed ({exc}); re-run `claude` to "
+                    "re-authenticate"
+                ]
+            return [f"rotated refresh token persisted to {creds.source_path}"]
+
+        # Otherwise hand the replacement to the caller, which may be able to store it
+        # somewhere this process cannot reach (a CI secret, a keychain).
+        emitted = self._emit_rotated_token(refreshed.refresh_token)
+        if emitted is not None:
+            return [f"rotated refresh token written to {emitted} for the caller to store"]
+        return [
+            "WARNING: the refresh token was rotated by the provider and could not be "
+            f"persisted ({creds.source_kind}); the stored credential is now stale — "
+            "update it with a fresh value from `extract_tokens.py`"
+        ]
+
+    def _emit_rotated_token(self, token: Optional[str]) -> Optional[str]:
+        """Write a rotated refresh token to the configured path, owner-readable only.
+
+        The value is never logged or returned in a note: only the path is reported, so
+        the token cannot leak into a summary, an artifact or a CI log.
+        """
+        target_path = self.options.rotated_token_path
+        if not target_path or not token:
+            return None
+        target = expand(target_path)
         try:
-            self._write_credential_file(creds, refreshed)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Create with restrictive permissions before writing any bytes.
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, token.encode("utf-8"))
+            finally:
+                os.close(fd)
         except OSError as exc:
-            return [
-                "WARNING: the refresh token was rotated but writing it back to "
-                f"{creds.source_path} failed ({exc}); re-run `claude` to re-authenticate"
-            ]
-        return [f"rotated refresh token persisted to {creds.source_path}"]
+            self.log(f"could not emit rotated token to {target} ({exc})")
+            return None
+        return str(target)
 
     def _write_credential_file(
         self, creds: ClaudeCredentials, refreshed: TokenRefresh
@@ -2154,6 +2185,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="append the block to $GITHUB_STEP_SUMMARY (or PATH)",
     )
     parser.add_argument(
+        "--emit-rotated-token",
+        default=None,
+        metavar="PATH",
+        help=(
+            "if a refresh rotates the token and it cannot be written back to its own "
+            "source, write the replacement to PATH (mode 600) so the caller can store "
+            "it; the value is never logged"
+        ),
+    )
+    parser.add_argument(
         "--no-refresh",
         action="store_true",
         help="never exchange a refresh token; read-only against the existing access token",
@@ -2256,7 +2297,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("--no-refresh and --allow-refresh are mutually exclusive", file=sys.stderr)
         return 2
     refresh_mode = "never" if args.no_refresh else ("always" if args.allow_refresh else "auto")
-    options = RunOptions(refresh_mode=refresh_mode)
+    options = RunOptions(
+        refresh_mode=refresh_mode, rotated_token_path=args.emit_rotated_token
+    )
     reports = collect_reports(providers, args.timeout, args.verbose, options)
 
     text = SummaryFormatter(width=args.width).render(reports)

@@ -317,6 +317,7 @@ degrades its own provider.
 | `OPENAI_PROJECT_ID` | *optional* | Recommended for `sk-proj-…` keys |
 | `GCP_SERVICE_ACCOUNT_JSON` | Antigravity | Service account key JSON, pasted whole |
 | `GCP_PROJECT_ID` | Antigravity | Project hosting `aiplatform.googleapis.com` |
+| `CLAUDE_SECRET_UPDATER_PAT` | *optional* | Fine-grained PAT with `Secrets: write` on this repo, so the workflow can store rotated Claude tokens — see [Token safety](#token-safety) |
 
 Two repository **variables** (not secrets) tune Antigravity behaviour:
 `AGY_TIER_OVERRIDE` and `AGY_LOOKBACK_HOURS`.
@@ -460,6 +461,9 @@ If you run this behind an egress allowlist, permit these hosts:
 --raw                  include raw provider payloads in JSON output
 --width N              ASCII block width (default 65)
 --github-summary[=PATH]  append the block to $GITHUB_STEP_SUMMARY (or PATH)
+--emit-rotated-token PATH
+                       write a rotated refresh token to PATH (mode 600) when it cannot
+                       be written back to its source; the value is never logged
 --no-refresh           never exchange a refresh token; read-only against whatever
                        access token already exists
 --allow-refresh        refresh even when the rotated token cannot be written back
@@ -606,12 +610,39 @@ enforced rather than merely documented.
 | `~/.claude/.credentials.json` | Used as-is | Refreshed, and the rotated token is **written back atomically**, preserving every unrelated field and re-applying mode `600` |
 | macOS Keychain | Used as-is | **Refused.** The Keychain cannot be rewritten safely from here, so consuming the token would log the CLI out. Run `claude -p ok` to let the CLI refresh it, then retry |
 
-Two flags control this:
+With `--emit-rotated-token PATH`, any rotation that cannot be written back to its own
+source is written to `PATH` instead, so a caller that *can* store it (a CI workflow
+updating its own secret) is able to.
+
+Three flags control this:
 
 - `--no-refresh` — never refresh under any circumstance. The safest mode for a monitoring
   cron job: it can only read a token that already exists.
 - `--allow-refresh` — override the Keychain refusal. Only use this if you accept
   re-running `claude` to log back in afterwards.
+- `--emit-rotated-token PATH` — when a rotation cannot be written back to its own source,
+  write the replacement to `PATH` with mode `600` so the caller can store it. Only the
+  path is reported; the value never reaches stdout, the summary, the JSON payload or a
+  log. This is how CI keeps itself alive — see below.
+
+### Keeping CI alive across rotations
+
+A workflow cannot write its own secrets, so a rotated token would strand the next run.
+The workflow therefore runs `check_usage.py --emit-rotated-token "$RUNNER_TEMP/..."` and a
+follow-up step pushes the value into the secret with `gh secret set`, registering it with
+`::add-mask::` first so it cannot appear in the log.
+
+That step needs a **fine-grained PAT with `Secrets: write`** on this repository, stored as
+the secret `CLAUDE_SECRET_UPDATER_PAT`. Without it the run still succeeds and emits a
+warning telling you to re-seed manually.
+
+> **This does not stop CI from logging out your local CLI.** One refresh-token chain
+> cannot be shared: when the workflow rotates the token, whatever your laptop holds
+> becomes invalid, and `claude` will need to log in again. Keeping CI self-sufficient and
+> keeping your laptop logged in requires **two independent logins** — authenticate
+> somewhere separate (a container or VM) and put *that* refresh token in the secret,
+> leaving your laptop's own session untouched. Otherwise expect to re-run `claude` after
+> each workflow run.
 
 If you are ever logged out by a token rotation, the recovery is simply to re-authenticate:
 

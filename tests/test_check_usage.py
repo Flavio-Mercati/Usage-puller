@@ -538,6 +538,108 @@ def test_claude_rotated_env_token_warns_secret_is_stale() -> None:
     assert "WARNING" in cu.SummaryFormatter().render([report])
 
 
+def test_claude_rotated_env_token_emitted_to_file(tmp_path: Any) -> None:
+    """CI cannot write its own secrets, so the replacement is handed to the caller."""
+    os.environ["CLAUDE_REFRESH_TOKEN"] = "rt-old"
+    os.environ.pop("CLAUDE_ACCESS_TOKEN", None)
+    target = Path(tmp_path) / "nested" / "rotated_token"
+    routes = {
+        "oauth/token": (200, {"access_token": "at-new", "refresh_token": "rt-rotated"}),
+        "oauth/usage": (200, CLAUDE_SCOPED),
+    }
+    report = cu.ClaudeResolver(
+        RoutedHttp(routes),
+        options=cu.RunOptions(rotated_token_path=str(target)),
+    ).resolve()
+
+    assert report.status == cu.STATUS_OK, report.message
+    assert target.read_text() == "rt-rotated"
+    # Parent directory is created on demand.
+    assert target.parent.is_dir()
+    if os.name != "nt":
+        assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_rotated_token_value_never_appears_in_any_output(tmp_path: Any) -> None:
+    """The token must reach the file and nothing else: not the summary, not the JSON."""
+    os.environ["CLAUDE_REFRESH_TOKEN"] = "rt-old"
+    os.environ.pop("CLAUDE_ACCESS_TOKEN", None)
+    secret = "rt-SUPERSECRET-must-not-leak"
+    target = Path(tmp_path) / "rotated_token"
+    routes = {
+        "oauth/token": (200, {"access_token": "at-new", "refresh_token": secret}),
+        "oauth/usage": (200, CLAUDE_SCOPED),
+    }
+    report = cu.ClaudeResolver(
+        RoutedHttp(routes),
+        options=cu.RunOptions(rotated_token_path=str(target)),
+    ).resolve()
+
+    assert target.read_text() == secret
+    rendered = cu.SummaryFormatter().render([report])
+    assert secret not in rendered
+    payload = json.dumps(cu.build_json_payload([report], include_raw=True))
+    assert secret not in payload
+    assert secret not in " ".join(report.notes)
+    assert secret not in (report.message or "")
+    # The path is reported so the caller knows where to look.
+    assert str(target) in " ".join(report.notes)
+
+
+def test_claude_rotated_env_token_warns_when_no_emit_path() -> None:
+    """Without an emit path there is nowhere to put it, so the user must be told."""
+    os.environ["CLAUDE_REFRESH_TOKEN"] = "rt-old"
+    os.environ.pop("CLAUDE_ACCESS_TOKEN", None)
+    routes = {
+        "oauth/token": (200, {"access_token": "at-new", "refresh_token": "rt-rotated"}),
+        "oauth/usage": (200, CLAUDE_SCOPED),
+    }
+    report = cu.ClaudeResolver(RoutedHttp(routes)).resolve()
+    assert any("stale" in note for note in report.notes), report.notes
+    assert "WARNING" in cu.SummaryFormatter().render([report])
+
+
+def test_emit_path_failure_degrades_to_warning(tmp_path: Any) -> None:
+    """An unwritable emit path must not crash the run."""
+    os.environ["CLAUDE_REFRESH_TOKEN"] = "rt-old"
+    os.environ.pop("CLAUDE_ACCESS_TOKEN", None)
+    blocker = Path(tmp_path) / "blocker"
+    blocker.write_text("not a directory")
+    routes = {
+        "oauth/token": (200, {"access_token": "at-new", "refresh_token": "rt-rotated"}),
+        "oauth/usage": (200, CLAUDE_SCOPED),
+    }
+    report = cu.ClaudeResolver(
+        RoutedHttp(routes),
+        options=cu.RunOptions(rotated_token_path=str(blocker / "sub" / "token")),
+    ).resolve()
+    assert report.status == cu.STATUS_OK, report.message
+    assert any("stale" in note for note in report.notes), report.notes
+
+
+def test_file_source_prefers_write_back_over_emit(tmp_path: Any) -> None:
+    """A writable credential file is updated in place; the emit path stays unused."""
+    for name in ("CLAUDE_REFRESH_TOKEN", "CLAUDE_ACCESS_TOKEN"):
+        os.environ.pop(name, None)
+    creds = Path(tmp_path) / "creds-pref.json"
+    creds.write_text(json.dumps({"claudeAiOauth": {"refreshToken": "rt-old", "expiresAt": 1}}))
+    os.environ["CLAUDE_CREDENTIALS_PATH"] = str(creds)
+    emit = Path(tmp_path) / "should-not-exist"
+    routes = {
+        "oauth/token": (200, {"access_token": "at-new", "refresh_token": "rt-rotated"}),
+        "oauth/usage": (200, CLAUDE_SCOPED),
+    }
+    try:
+        report = cu.ClaudeResolver(
+            RoutedHttp(routes), options=cu.RunOptions(rotated_token_path=str(emit))
+        ).resolve()
+    finally:
+        os.environ.pop("CLAUDE_CREDENTIALS_PATH", None)
+    assert report.status == cu.STATUS_OK, report.message
+    assert json.loads(creds.read_text())["claudeAiOauth"]["refreshToken"] == "rt-rotated"
+    assert not emit.exists()
+
+
 def test_claude_unrotated_refresh_writes_nothing(tmp_path: Any) -> None:
     """If the provider does not rotate, the credential file must be left untouched."""
     for name in ("CLAUDE_REFRESH_TOKEN", "CLAUDE_ACCESS_TOKEN"):

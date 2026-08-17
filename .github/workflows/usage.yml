@@ -78,6 +78,7 @@ jobs:
           set -euo pipefail
 
           ARGS=(--github-summary --json-out usage-snapshot.json)
+          ARGS+=(--emit-rotated-token "${RUNNER_TEMP}/claude_rotated_token")
 
           if [ -n "${INPUT_PROVIDERS:-}" ] && [ "${INPUT_PROVIDERS}" != "all" ]; then
             ARGS+=(--only "${INPUT_PROVIDERS}")
@@ -95,6 +96,51 @@ jobs:
           # so an unconfigured provider still produces a readable summary. One run emits
           # both the ASCII block and the JSON artifact — no duplicate quota API calls.
           python check_usage.py "${ARGS[@]}"
+
+      # Anthropic rotates refresh tokens: the value in CLAUDE_REFRESH_TOKEN is invalid
+      # the moment this run uses it. check_usage.py writes the replacement to a file
+      # under RUNNER_TEMP (never to stdout, the summary or the artifact), and this step
+      # pushes it back into the secret so the next run has a usable token.
+      #
+      # GITHUB_TOKEN cannot write secrets, so this needs a PAT with Secrets: write on
+      # this repository, stored as CLAUDE_SECRET_UPDATER_PAT. Without it the step
+      # explains what to do and the run still succeeds.
+      - name: Persist rotated Claude refresh token
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_SECRET_UPDATER_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          TOKEN_FILE="${RUNNER_TEMP}/claude_rotated_token"
+
+          if [ ! -s "${TOKEN_FILE}" ]; then
+            echo "No rotated token emitted - nothing to persist."
+            exit 0
+          fi
+
+          # Register the value as a secret so it can never surface in this log.
+          echo "::add-mask::$(cat "${TOKEN_FILE}")"
+
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::The provider rotated CLAUDE_REFRESH_TOKEN but no" \
+                 "CLAUDE_SECRET_UPDATER_PAT secret is set, so it cannot be updated." \
+                 "The next run will fail until you re-seed it with" \
+                 "'python3 extract_tokens.py --reveal --format gh | bash'."
+            rm -f "${TOKEN_FILE}"
+            exit 0
+          fi
+
+          if gh secret set CLAUDE_REFRESH_TOKEN --repo "${REPO}" \
+               --body "$(cat "${TOKEN_FILE}")"; then
+            echo "CLAUDE_REFRESH_TOKEN updated with the rotated value."
+          else
+            echo "::error::Failed to update CLAUDE_REFRESH_TOKEN. Check that" \
+                 "CLAUDE_SECRET_UPDATER_PAT has Secrets: write on ${REPO}." \
+                 "Re-seed manually before the next run."
+          fi
+
+          rm -f "${TOKEN_FILE}"
 
       - name: Upload snapshot artifact
         if: always()
