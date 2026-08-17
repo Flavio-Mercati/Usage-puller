@@ -62,26 +62,27 @@ CLAUDE_NESTED = {
     ],
 }
 
-# Shape C: the layout api.anthropic.com actually returns (captured from a live account,
-# values altered). Note there is no `fable` key: the per-model slots are named/codenamed
-# and mostly null, and `limits[]` is the authoritative structure.
+# Shape C: the field layout api.anthropic.com actually returns. Structure is faithful;
+# all figures, timestamps and pool names are synthetic. Real payloads name the per-model
+# slots after products or internal codenames, and they are frequently null even when a
+# scoped pool is live inside `limits[]` -- which is the authoritative structure.
 CLAUDE_LIVE = {
     "five_hour": {
-        "utilization": 5.0,
-        "resets_at": "2026-08-17T14:00:00.331786+00:00",
+        "utilization": 7.0,
+        "resets_at": "2026-08-17T14:00:00.111111+00:00",
         "limit_dollars": None,
         "used_dollars": None,
     },
     "seven_day": {
-        "utilization": 45.0,
-        "resets_at": "2026-08-21T10:00:00.331807+00:00",
+        "utilization": 41.0,
+        "resets_at": "2026-08-21T10:00:00.222222+00:00",
     },
     "seven_day_oauth_apps": None,
     "seven_day_opus": None,
     "seven_day_sonnet": None,
     "seven_day_cowork": None,
-    "tangelo": None,
-    "nimbus_quill": {"utilization": 0.0, "resets_at": None},
+    "pool_alpha": None,
+    "pool_beta": {"utilization": 0.0, "resets_at": None},
     "extra_usage": {
         "is_enabled": False,
         "monthly_limit": None,
@@ -94,56 +95,56 @@ CLAUDE_LIVE = {
         {
             "kind": "session",
             "group": "session",
-            "percent": 5,
+            "percent": 7,
             "severity": "normal",
-            "resets_at": "2026-08-17T14:00:00.331786+00:00",
+            "resets_at": "2026-08-17T14:00:00.111111+00:00",
             "scope": None,
             "is_active": False,
         },
         {
             "kind": "weekly_all",
             "group": "weekly",
-            "percent": 45,
+            "percent": 41,
             "severity": "normal",
-            "resets_at": "2026-08-21T10:00:00.331807+00:00",
+            "resets_at": "2026-08-21T10:00:00.222222+00:00",
             "scope": None,
             "is_active": False,
         },
     ],
 }
 
-# Shape D: a scoped per-model pool as the endpoint really expresses it. `scope` is a
+# Shape D: a scoped per-model pool as the endpoint really expresses it -- `scope` is a
 # nested object, not a string, and the pool is a distinct weekly bucket alongside
-# weekly_all -- captured from a live Max account.
+# weekly_all. Structure is faithful; all figures and timestamps are synthetic.
 CLAUDE_SCOPED = {
-    "five_hour": {"utilization": 2.0, "resets_at": "2026-08-17T19:09:59.988021+00:00"},
-    "seven_day": {"utilization": 47.0, "resets_at": "2026-08-21T09:59:59.988048+00:00"},
+    "five_hour": {"utilization": 3.0, "resets_at": "2026-08-17T18:00:00.123456+00:00"},
+    "seven_day": {"utilization": 52.0, "resets_at": "2026-08-21T09:00:00.123456+00:00"},
     "seven_day_opus": None,
     "limits": [
         {
             "kind": "session",
             "group": "session",
-            "percent": 2,
+            "percent": 3,
             "severity": "normal",
-            "resets_at": "2026-08-17T19:09:59.988021+00:00",
+            "resets_at": "2026-08-17T18:00:00.123456+00:00",
             "scope": None,
             "is_active": False,
         },
         {
             "kind": "weekly_all",
             "group": "weekly",
-            "percent": 47,
+            "percent": 52,
             "severity": "normal",
-            "resets_at": "2026-08-21T09:59:59.988048+00:00",
+            "resets_at": "2026-08-21T09:00:00.123456+00:00",
             "scope": None,
             "is_active": False,
         },
         {
             "kind": "weekly_scoped",
             "group": "weekly",
-            "percent": 81,
+            "percent": 76,
             "severity": "warning",
-            "resets_at": "2026-08-21T09:59:59.988284+00:00",
+            "resets_at": "2026-08-21T09:00:00.123789+00:00",
             "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
             "is_active": True,
         },
@@ -298,9 +299,9 @@ def test_claude_scoped_pool_from_nested_scope_object() -> None:
     """`scope: {"model": {"display_name": "Fable"}}` must label the pool, not stringify."""
     report = _resolve_claude(CLAUDE_SCOPED)
     assert report.status == cu.STATUS_OK, report.message
-    assert _windows(report) == {"5h": 2.0, "7d": 47.0, "Fable 7d": 81.0}
+    assert _windows(report) == {"5h": 3.0, "7d": 52.0, "Fable 7d": 76.0}
     rendered = cu.SummaryFormatter().render([report])
-    assert "Fable 7d: 81%" in rendered
+    assert "Fable 7d: 76%" in rendered
     assert "{" not in rendered and "display_name" not in rendered
 
 
@@ -309,7 +310,7 @@ def test_claude_scoped_pool_surfaces_severity() -> None:
     report = _resolve_claude(CLAUDE_SCOPED)
     fable = next(w for w in report.windows if w.label == "Fable 7d")
     assert fable.severity == "warning"
-    assert "Fable 7d: 81% (warning)" in cu.SummaryFormatter().render([report])
+    assert "Fable 7d: 76% (warning)" in cu.SummaryFormatter().render([report])
     # A normal severity must not add noise.
     assert "(normal)" not in cu.SummaryFormatter().render([report])
 
@@ -329,7 +330,7 @@ def test_claude_scoped_pool_exposes_remaining_in_json() -> None:
     fable = next(
         w for w in payload["providers"][0]["windows"] if w["label"] == "Fable 7d"
     )
-    assert fable["remaining_percent"] == 19.0
+    assert fable["remaining_percent"] == 24.0
     assert fable["severity"] == "warning"
 
 
@@ -337,7 +338,7 @@ def test_claude_live_payload_shape() -> None:
     """The layout api.anthropic.com actually returns, parsed via limits[]."""
     report = _resolve_claude(CLAUDE_LIVE)
     assert report.status == cu.STATUS_OK, report.message
-    assert _windows(report) == {"5h": 5.0, "7d": 45.0}
+    assert _windows(report) == {"5h": 7.0, "7d": 41.0}
     assert report.windows[0].label == "5h"
     assert report.windows[0].resets_at is not None
     # The weekly countdown is actionable, so it is shown rather than suppressed.
@@ -351,7 +352,7 @@ def test_claude_live_payload_reports_empty_sub_pools_explicitly() -> None:
     facts = dict(report.facts)
     assert "none active" in facts["Sub-pools"]
     assert "seven_day_opus" in " ".join(report.notes)
-    assert "nimbus_quill" in " ".join(report.notes)
+    assert "pool_beta" in " ".join(report.notes)
     assert "Sub-pools: none active" in cu.SummaryFormatter().render([report])
 
 
@@ -389,7 +390,7 @@ def test_claude_limits_array_surfaces_active_sub_pool() -> None:
         }
     ]
     report = _resolve_claude(payload)
-    assert _windows(report) == {"5h": 5.0, "7d": 45.0, "Opus 7d": 38.0}
+    assert _windows(report) == {"5h": 7.0, "7d": 41.0, "Opus 7d": 38.0}
     assert "Sub-pools" not in dict(report.facts)
 
 
