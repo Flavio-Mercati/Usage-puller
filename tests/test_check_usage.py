@@ -318,6 +318,8 @@ def test_claude_rotated_env_token_warns_secret_is_stale() -> None:
     report = cu.ClaudeResolver(RoutedHttp(routes)).resolve()
     assert report.status == cu.STATUS_OK, report.message
     assert any("stale" in note for note in report.notes), report.notes
+    # The warning must be visible in the ASCII block, not just the JSON artifact.
+    assert "WARNING" in cu.SummaryFormatter().render([report])
 
 
 def test_claude_unrotated_refresh_writes_nothing(tmp_path: Any) -> None:

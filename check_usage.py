@@ -225,6 +225,9 @@ class ProviderReport:
         fields.extend(f"{key}: {value}" for key, value in self.facts)
         if self.status == STATUS_PARTIAL and self.message:
             fields.append(f"Note: {self.message}")
+        # Warnings must reach the ASCII block itself: a note saying a stored secret has
+        # gone stale is useless if it only appears in the JSON artifact.
+        fields.extend(note for note in self.notes if note.startswith("WARNING"))
         return fields or [f"Status: {STATUS_PARTIAL} (no quota fields returned)"]
 
     @property
