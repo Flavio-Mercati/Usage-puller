@@ -1,0 +1,28 @@
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*-service-account*.json
+service-account*.json
+credentials.json
+.credentials.json
+
+# Generated snapshots
+usage-snapshot.json
+usage-snapshot*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

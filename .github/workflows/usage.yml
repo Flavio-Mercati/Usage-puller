@@ -1,0 +1,103 @@
+name: AI Usage Snapshot
+
+# Triggered by hand — including from the GitHub Mobile app:
+#   Repo -> Actions -> "AI Usage Snapshot" -> Run workflow
+# The result lands in the run's Summary tab as a single copiable code block.
+on:
+  workflow_dispatch:
+    inputs:
+      providers:
+        description: "Providers to query (all, or a comma list: claude,codex,agy)"
+        required: false
+        default: "all"
+        type: string
+      timeout:
+        description: "Per-request HTTP timeout in seconds (3-60)"
+        required: false
+        default: "10"
+        type: string
+      verbose:
+        description: "Log every HTTP request to the job log"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-usage-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    name: Collect quota snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Collect quota snapshot
+        env:
+          # --- Anthropic Claude Code ------------------------------------------------
+          CLAUDE_REFRESH_TOKEN: ${{ secrets.CLAUDE_REFRESH_TOKEN }}
+          CLAUDE_ORG_ID: ${{ secrets.CLAUDE_ORG_ID }}
+          CLAUDE_OAUTH_CLIENT_ID: ${{ secrets.CLAUDE_OAUTH_CLIENT_ID }}
+          # --- OpenAI Codex ---------------------------------------------------------
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
+          OPENAI_PROJECT_ID: ${{ secrets.OPENAI_PROJECT_ID }}
+          # --- Google Antigravity (agy) --------------------------------------------
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          AGY_TIER_OVERRIDE: ${{ vars.AGY_TIER_OVERRIDE }}
+          AGY_LOOKBACK_HOURS: ${{ vars.AGY_LOOKBACK_HOURS }}
+          # Inputs are passed through the environment rather than interpolated into the
+          # script body, so a crafted input cannot become shell code.
+          INPUT_PROVIDERS: ${{ inputs.providers }}
+          INPUT_TIMEOUT: ${{ inputs.timeout }}
+          INPUT_VERBOSE: ${{ inputs.verbose }}
+        run: |
+          set -euo pipefail
+
+          ARGS=(--github-summary --json-out usage-snapshot.json)
+
+          if [ -n "${INPUT_PROVIDERS:-}" ] && [ "${INPUT_PROVIDERS}" != "all" ]; then
+            ARGS+=(--only "${INPUT_PROVIDERS}")
+          fi
+
+          if [ -n "${INPUT_TIMEOUT:-}" ]; then
+            ARGS+=(--timeout "${INPUT_TIMEOUT}")
+          fi
+
+          if [ "${INPUT_VERBOSE:-false}" = "true" ]; then
+            ARGS+=(--verbose)
+          fi
+
+          # check_usage.py degrades per provider and exits 0 unless --strict is passed,
+          # so an unconfigured provider still produces a readable summary. One run emits
+          # both the ASCII block and the JSON artifact — no duplicate quota API calls.
+          python check_usage.py "${ARGS[@]}"
+
+      - name: Upload snapshot artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: usage-snapshot
+          path: usage-snapshot.json
+          retention-days: 7
+          if-no-files-found: warn

@@ -1,0 +1,12 @@
+# usage-puller runtime dependencies.
+#
+# check_usage.py degrades gracefully when any of these are absent (it falls back to
+# urllib for HTTP, skips .env loading, and reports Antigravity as UNCONFIGURED), so a
+# bare `python check_usage.py` still works on a stock interpreter. Install the full set
+# for Google Cloud support and the nicer HTTP stack.
+
+requests>=2.31,<3            # HTTP client used by every resolver
+google-auth>=2.29,<3         # GCP service account / ADC token minting
+google-api-python-client>=2.125,<3  # Service Usage discovery client (REST fallback exists)
+python-dotenv>=1.0,<2        # optional .env loading for local runs
+pydantic>=2.6,<3             # output schema validation behind --strict-schema
